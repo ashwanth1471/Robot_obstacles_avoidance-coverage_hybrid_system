@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Robot_Coverage_obstacle_avoidance & Pareto Visualization</title>
+  <style>
+    body { font-family: Arial; }
+    canvas { border: 1px solid black; margin: 10px; }
+    .row { display: flex; }
+    .controls input { width: 60px; }
+  </style>
+</head>
+
+<body>
+
+<h2>Robot AI</h2>
+
+<div class="controls">
+  X <input id="ox" value="2">
+  Y <input id="oy" value="2">
+  W <input id="ow" value="0.5">
+  H <input id="oh" value="0.5">
+  Speed <input type="range" id="speed" min="1" max="20" value="5">
+
+  <button onclick="addObstacle()">Add Obstacle</button>
+  <button onclick="runPlanner()">Run</button>
+  <button onclick="toggleCost()">Toggle CNN Cost</button>
+
+</div>
+
+<div class="row">
+  <canvas id="sim" width="600" height="600"></canvas>
+  <canvas id="pareto" width="400" height="400"></canvas>
+</div>
+
+<p id="metrics"></p>
+
+<script>
+let recorder;
+let recordedChunks = [];
+
+
+
+
+function startRecording() {
+  const combined = document.createElement("canvas");
+  combined.width = 1000;
+  combined.height = 600;
+  const cctx = combined.getContext("2d");
+
+  function drawCombined() {
+    cctx.clearRect(0,0,1000,600);
+    cctx.drawImage(canvas, 0, 0);
+    cctx.drawImage(paretoCanvas, 600, 0);
+  }
+
+  const stream = combined.captureStream(60);
+  recorder = new MediaRecorder(stream, { mimeType: "video/webm" });
+  recordedChunks = [];
+
+  recorder.ondataavailable = e => {
+    if (e.data.size > 0) recordedChunks.push(e.data);
+  };
+
+  recorder.onstop = saveVideo;
+  recorder.start();
+
+  function sync() {
+    drawCombined();
+    if (recorder && recorder.state !== "inactive") {
+      requestAnimationFrame(sync);
+    }
+  }
+
+  sync();
+}
+
+
+function stopRecording() {
+  if (recorder && recorder.state !== "inactive") {
+    recorder.stop();
+  }
+}
+
+function saveVideo() {
+  const blob = new Blob(recordedChunks, { type: "video/webm" });
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "robot.webm";
+  a.click();
+
+  URL.revokeObjectURL(url);
+}
+
+/* -------------------- GLOBALS -------------------- */
+const canvas = document.getElementById("sim");
+const ctx = canvas.getContext("2d");
+
+const paretoCanvas = document.getElementById("pareto");
+const pctx = paretoCanvas.getContext("2d");
+
+const scale = 6;
+const CELL = 0.05;
+
+let obstacles = [];
+let path = [];
+let costmap = null;
+let showCost = false;
+let animIdx = 0;
+
+
+let planning = false;
+
+let robotRadius = scale * 0.8;
+let lastRobotPos = null;
+
+let currentStep = 0;
+let interp = 0;      // interpolation between cells
+let frameDelay = 1;  // controlled by slider
+
+let currentAngle = 0;
+let targetAngle = 0;
+
+
+let speed = 50;
+
+document.getElementById("speed").addEventListener("input", e=>{
+  frameDelay = 21 - parseInt(e.target.value);
+});
+
+
+/* -------------------- DRAWING -------------------- */
+function drawGrid() {
+  ctx.strokeStyle = "#eee";
+  for (let i = 0; i < 600; i += scale) {
+    ctx.beginPath();
+    ctx.moveTo(i, 0); ctx.lineTo(i, 600);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(0, i); ctx.lineTo(600, i);
+    ctx.stroke();
+  }
+}
+
+function drawObstacles() {
+  ctx.fillStyle = "black";
+  obstacles.forEach(o => {
+    ctx.fillRect(
+      (o.x / CELL) * scale,
+      canvas.height - ((o.y + o.h) / CELL) * scale,
+      (o.w / CELL) * scale,
+      (o.h / CELL) * scale
+    );
+  });
+}
+
+function drawCostMap() {
+  if (!costmap || !showCost) return;
+  for (let r=0; r<costmap.length; r++) {
+    for (let c=0; c<costmap[0].length; c++) {
+      const v = costmap[r][c];
+      ctx.fillStyle = `rgba(255,0,0,${Math.min(0.6,v)})`;
+      ctx.fillRect(
+        c*scale,
+        canvas.height-(r+1)*scale,
+        scale, scale
+      );
+    }
+  }
+}
+
+
+function redraw() {
+  ctx.clearRect(0,0,600,600);
+  drawGrid();
+  drawCostMap();
+  drawObstacles();
+}
+/*---robot---*/
+function drawRobot(x, y, dx=0, dy=0) {
+
+  // robot body
+  ctx.fillStyle = "purple";
+  ctx.beginPath();
+  ctx.arc(x, y, robotRadius, 0, Math.PI * 2);
+  ctx.fill();
+
+  // direction arrow
+  if (dx !== 0 || dy !== 0) {
+    const len = Math.sqrt(dx*dx + dy*dy);
+    if (len > 0) {
+      ctx.strokeStyle = "white";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(
+        x + dx/len * robotRadius,
+        y + dy/len * robotRadius
+      );
+      ctx.stroke();
+    }
+  }
+}
+
+/* -------------------- OBSTACLES -------------------- */
+function addObstacle() {
+  obstacles.push({
+    x: parseFloat(ox.value),
+    y: parseFloat(oy.value),
+    w: parseFloat(ow.value),
+    h: parseFloat(oh.value)
+  });
+  redraw();
+  runPlanner();
+}
+
+/* Drag-to-draw */
+let drawing = false, sx, sy;
+canvas.addEventListener("mousedown", e => {
+  drawing = true;
+  sx = e.offsetX; sy = e.offsetY;
+});
+canvas.addEventListener("mouseup", e => {
+  if (!drawing) return;
+  drawing = false;
+
+  const ex = e.offsetX, ey = e.offsetY;
+  const x = Math.min(sx,ex) / scale * CELL;
+  const y = (600 - Math.max(sy,ey)) / scale * CELL;
+  const w = Math.abs(ex-sx) / scale * CELL;
+  const h = Math.abs(ey-sy) / scale * CELL;
+
+  obstacles.push({x,y,w,h});
+  redraw();
+  runPlanner();
+});
+
+/* -------------------- PLANNER -------------------- */
+function runPlanner() {
+
+  if (planning) return;   //  prevent overlap
+  planning = true;
+
+  redraw();
+
+  fetch("/plan", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      width: 5,
+      height: 5,
+      cell_size: CELL,
+      obstacles: obstacles
+    })
+  })
+  .then(r => r.json())
+  .then(p => {
+
+    fetch(`/trajectory/${p.plan_id}`)
+  .then(r => r.json())
+  .then(d => {
+    path = d.trajectory;
+
+    currentStep = 0;   //  reset step
+    interp = 0;        //  reset interpolation
+    lastRobotPos = null;
+
+    startRecording();
+    animate();
+  });
+
+
+    fetch(`/pareto/${p.plan_id}`)
+      .then(r => r.json())
+      .then(d => drawPareto(d.pareto));
+
+    fetch(`/costmap/${p.plan_id}`)
+      .then(r => r.json())
+      .then(c => {
+        costmap = c;
+        redraw();
+      });
+
+  })
+  .finally(() => {
+      planning = false;   //  release lock
+  });
+}
+
+
+
+function animate() {
+
+  if (!path.length) return;
+
+  redraw();
+
+  // Draw covered cells
+  for (let i = 0; i < currentStep; i++) {
+    const p = path[i];
+    ctx.fillStyle = "rgba(0,0,255,0.3)";
+    ctx.fillRect(
+      p.col * scale,
+      canvas.height - (p.row + 1) * scale,
+      scale,
+      scale
+    );
+  }
+
+  if (currentStep >= path.length - 1) {
+    stopRecording();
+    return;
+  }
+
+  const p1 = path[currentStep];
+  const p2 = path[currentStep + 1];
+
+  // Smooth interpolation
+  const x = (p1.col + (p2.col - p1.col) * interp) * scale;
+  const y = canvas.height - (p1.row + (p2.row - p1.row) * interp + 1) * scale;
+
+  // Draw robot body
+  const dx = p2.col - p1.col;
+  const dy = -(p2.row - p1.row);
+
+// Target direction
+targetAngle = Math.atan2(dy, dx);
+
+// --- Smooth steering ---
+let angleDiff = targetAngle - currentAngle;
+angleDiff = Math.atan2(Math.sin(angleDiff), Math.cos(angleDiff));
+currentAngle += angleDiff * 0.2;   // steering smoothness
+
+// --- Draw car emoji ---
+ctx.save();
+
+ctx.translate(x + scale/2, y + scale/2);
+ctx.rotate(currentAngle);
+
+ctx.font = `${scale*5}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif`;
+ctx.textAlign = "center";
+ctx.textBaseline = "middle";
+
+ctx.fillText("🚗", 0, 0);
+
+ctx.restore();
+
+
+
+
+
+
+  interp += 1 / frameDelay;
+
+  if (interp >= 1) {
+    interp = 0;
+    currentStep++;
+  }
+
+  requestAnimationFrame(animate);
+}
+
+
+
+
+/* -------------------- PARETO -------------------- */
+function drawPareto(pts) {
+  pctx.clearRect(0,0,400,400);
+  pctx.strokeRect(40,40,320,320);
+
+  if (!pts.length) return;
+
+  const L = pts.map(p => p.length);
+  const T = pts.map(p => p.turns);
+  const C = pts.map(p => p.risk);
+
+  const minL = Math.min(...L), maxL = Math.max(...L);
+  const minT = Math.min(...T), maxT = Math.max(...T);
+  const minC = Math.min(...C), maxC = Math.max(...C);
+
+
+  pts.forEach(p => {
+    const x = 40 + (p.length - minL) / (maxL - minL + 1e-6) * 320;
+    const y = 360 - (p.turns - minT) / (maxT - minT + 1e-6) * 320;
+
+    //  normalize CNN cost
+    const cNorm = (p.risk - minC) / (maxC - minC + 1e-6);
+
+    //  green (low cost) → red (high cost)
+    const r = Math.floor(255 * cNorm);
+    const g = Math.floor(255 * (1 - cNorm));
+
+    pctx.fillStyle = `rgb(${r},${g},0)`;
+    pctx.beginPath();
+    pctx.arc(x, y, 5, 0, Math.PI * 2);
+    pctx.fill();
+  });
+}
+
+
+/* -------------------- UTIL -------------------- */
+function toggleCost() {
+  showCost = !showCost;
+  redraw();
+}
+
+
+
+/* -------------------- INIT -------------------- */
+drawGrid();
+</script>
+
+</body>
+</html>
